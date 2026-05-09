@@ -2,17 +2,13 @@
 
 基于 [klsf/codex-register](https://github.com/klsf/codex-register) 的个人复刻。
 
-批量注册 OpenAI 账号 → 授权 Codex → 生成 auth 文件 → 检查额度。
+批量注册 OpenAI 账号。
 
 ## 功能
 
-| 功能 | 命令 |
-|------|------|
-| 批量注册 | `npm run dev -- --n 1` |
-| 注册并授权 | `npm run dev -- --email xxx --sign` |
-| 只做授权 | `npm run dev -- --email xxx --auth` |
-| 检查额度 | `npm run check` |
-| 检查 CPA 额度 | `npm run check:cpa` |
+- 批量注册 OpenAI 账号
+- 支持多种邮箱提供商：Cloudflare、Gmail、Hotmail、GPTMail 等
+- 自动获取邮箱验证码
 
 ## 快速开始
 
@@ -24,8 +20,16 @@ npm install
 cp config.example.json config.json
 # 编辑 config.json，填入代理地址和邮箱配置
 
-# 3. 运行
+# 3. 注册
 npm run dev -- --n 1
+```
+
+## 常用命令
+
+```bash
+npm run dev -- --n 1                          # 注册 1 个账号
+npm run dev -- --n 5                          # 注册 5 个账号
+npm run dev -- --email your@email.com         # 指定邮箱注册
 ```
 
 ## 配置说明
@@ -50,37 +54,6 @@ npm run dev -- --n 1
 | `gptmail` | `gptMailApiKey` |
 | `2925` | `2925EmailAddress`, `2925Password` |
 
-## 检查额度
-
-```bash
-npm run check                              # 检查本地 auth 目录
-npm run check -- --limit 20 --table        # 检查前 20 个
-npm run check -- --refresh --table         # 刷新 token 后检查
-npm run check -- -c 8                      # 8 并发
-npm run check:cpa                          # 从 CLIProxyAPI 检查
-```
-
-输出示例：
-
-```
-[✅️][free][100.00%]someone@example.com
-[❌️]someone@example.com-token expired
-
-总数 10 | 可用 8 | 限额 1 | 可用额度 6.42
-```
-
-## CLIProxyAPI 集成
-
-授权成功后自动上传 auth 文件：
-
-```json
-{
-  "cliproxyApiAutoUploadAuth": true,
-  "cliproxyApiBaseUrl": "http://localhost:8317",
-  "cliproxyApiManagementKey": "your_key"
-}
-```
-
 ## 安全提醒
 
 以下文件已被 `.gitignore` 排除，请勿提交：
@@ -94,10 +67,7 @@ npm run check:cpa                          # 从 CLIProxyAPI 检查
 ```
 src/
 ├── index.ts              # 主入口
-├── openai.ts             # OpenAI 注册/授权核心
-├── check-auth-quota.ts   # 额度检查
-├── cliproxyapi.ts        # CLIProxyAPI 集成
-├── batch-register.ts     # 批量注册
+├── openai.ts             # OpenAI 注册核心
 ├── config.ts             # 配置定义
 ├── constants.ts          # 常量
 ├── mail/                 # 邮箱 provider
@@ -106,8 +76,7 @@ src/
 │   ├── hotmail.ts
 │   ├── gptmail.ts
 │   └── 2925.ts
-└── sms/                  # 短信 provider
-    └── heroSMS.ts
+└── utils.ts              # 工具函数
 ```
 
 ## 致谢
