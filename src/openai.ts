@@ -1,26 +1,35 @@
+import {mkdir, writeFile} from "node:fs/promises";
 import {createInterface} from "node:readline/promises";
 import net from "node:net";
 import {stdin as input, stdout as output} from "node:process";
 import tls from "node:tls";
 import {URLSearchParams} from "node:url";
+import path from "node:path";
 import {Agent, ProxyAgent, setGlobalDispatcher, type Dispatcher} from "undici";
 import {SocksClient} from "socks";
 import makeFetchCookie from "fetch-cookie";
 import {CookieJar} from "tough-cookie";
-import {archiveAccountRecord, formatLocalTimestamp} from "./account-archive.js";
 import {appConfig} from "./config.js";
+import {shouldAutoUploadAuthToCLIProxyAPI, uploadAuthFileToCLIProxyAPI} from "./cliproxyapi.js";
 import {defaultDeviceProfile, type DeviceProfile, getDeviceClientHints} from "./device-profile.js";
 import {
     AUTH_AUTHORIZE_CONTINUE_URL,
     AUTH_BASE_URL,
     AUTH_EMAIL_OTP_SEND_URL,
     AUTH_EMAIL_OTP_VALIDATE_URL,
+    AUTH_OAUTH_TOKEN_URLS,
+    AUTH_PASSWORD_VERIFY_URL,
     AUTH_REGISTER_URL,
+    AUTH_WORKSPACE_SELECT_URL,
     CHATGPT_BASE_URL,
+    DEFAULT_CLIENT_ID,
+    DEFAULT_REDIRECT_URI,
     DEFAULT_USER_AGENT,
 } from "./constants.js";
 import {getEmailAddress, getEmailVerificationCode, MAILBOX_CONFIG} from "./mailbox.js";
 import {fetchSentinelToken} from "./sentinel.js";
+import { pkceCodeChallenge, randomUrlSafeString } from "./utils.js";
+import {ISMSActivationBroker} from "./sms/activation-broker.js";
 
 type FetchLike = typeof fetch;
 
@@ -122,11 +131,61 @@ async function createSocksSocket(
 
 interface ContinueResponse {
     continue_url: string;
+    method?: string;
     page?: {
+        type?: string;
+        backstack_behavior?: string;
         payload?: {
             url?: string;
         };
     };
+}
+
+interface AuthSessionWorkspace {
+    id: string;
+    name?: string;
+    kind?: string;
+}
+
+interface ClientAuthSessionPayload {
+    workspaces?: AuthSessionWorkspace[];
+}
+
+interface OAuthTokenResponse {
+    access_token: string;
+    refresh_token?: string;
+    id_token?: string;
+    expires_in?: number;
+    token_type?: string;
+    scope?: string;
+}
+
+interface JwtPayload {
+    email?: string;
+    exp?: number;
+    "https://api.openai.com/auth"?: {
+        chatgpt_account_id?: string;
+    };
+}
+
+export interface AuthLoginResult {
+    callbackURL: string;
+    code: string;
+    state: string;
+    authFile?: string;
+}
+
+export interface SavedAuthRecord {
+    access_token: string;
+    account_id: string;
+    disabled: boolean;
+    email: string;
+    expired: string;
+    id_token: string;
+    last_refresh: string;
+    refresh_token: string;
+    type: "codex";
+    websockets: false;
 }
 
 export interface OpenAIClientOptions {
@@ -135,6 +194,8 @@ export interface OpenAIClientOptions {
     userAgent?: string;
     deviceProfile?: DeviceProfile;
     manualMode?: boolean;
+    signupScreenHint?: string;
+    smsBroker?: ISMSActivationBroker
 }
 
 export class OpenAIClient {
@@ -146,9 +207,14 @@ export class OpenAIClient {
     readonly userAgent: string;
     readonly deviceProfile: DeviceProfile;
     readonly clientHints: ReturnType<typeof getDeviceClientHints>;
+    readonly signupScreenHint: string;
+    state = "";
+    codeVerifier = "";
     deviceID = "";
+    readonly smsBroker?: ISMSActivationBroker
 
     constructor(options: OpenAIClientOptions) {
+        this.smsBroker = options.smsBroker;
         this.email = options.email?.trim() ?? "";
         this.password = options.password;
         this.deviceProfile = options.deviceProfile
@@ -163,6 +229,7 @@ export class OpenAIClient {
         this.userAgent = this.deviceProfile.userAgent;
         this.clientHints = getDeviceClientHints(this.deviceProfile);
         this.manualMode = options.manualMode ?? !this.email;
+        this.signupScreenHint = options.signupScreenHint?.trim() || "login_or_signup";
         this.jar = new CookieJar();
         setGlobalDispatcher(createDispatcher(resolveProxyUrl(), shouldAllowInsecureTLS()));
         const cookieFetch = makeFetchCookie(fetch, this.jar) as FetchLike;
@@ -172,6 +239,97 @@ export class OpenAIClient {
 
     private logProgress(current: number | string, total: number, message: string): void {
         console.log(`[${current}/${total}] ${message}`);
+    }
+
+    async authLoginHTTP(): Promise<AuthLoginResult> {
+        const totalSteps = 6;
+        this.logProgress(1, totalSteps, "打开登录授权页");
+        const oauthUrl = this.prepareManualLogin();
+        const oauthResp = await this.fetch(oauthUrl, {
+            redirect: "follow",
+            headers: this.createBrowserHeaders({
+                "accept-encoding": "gzip, deflate, br",
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+            }),
+        });
+        if (!oauthResp.ok) {
+            throw new Error(`OauthUrl请求失败: ${oauthResp.status}`);
+        }
+        if (oauthResp.url.startsWith(DEFAULT_REDIRECT_URI)) {
+            const result = this.extractAuthResult(oauthResp.url);
+            const authRecord = await this.exchangeCodeForToken(result.code);
+            const authPath = await this.saveAuthRecord(authRecord);
+            result.authFile = authPath;
+            return result;
+        }
+        if (
+            oauthResp.url !== `${AUTH_BASE_URL}/log-in` &&
+            oauthResp.url !== `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`
+        ) {
+            throw new Error(`OauthUrl重定向到错误的URL: ${oauthResp.url}`);
+        }
+
+        this.deviceID = await this.readCookie("https://openai.com", "oai-did");
+        if (!this.deviceID) {
+            throw new Error("OauthUrl未返回oai-did cookie");
+        }
+
+        if (oauthResp.url === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
+            this.logProgress(5, totalSteps, "选择工作区");
+            const continueURL = await this.selectWorkspace(oauthResp.url);
+            this.logProgress(6, totalSteps, "交换授权并保存凭证");
+            const result = await this.followOAuthRedirects(continueURL);
+            const authRecord = await this.exchangeCodeForToken(result.code);
+            const authPath = await this.saveAuthRecord(authRecord);
+            result.authFile = authPath;
+            return result;
+        }
+
+        this.logProgress(2, totalSteps, "提交登录邮箱");
+        let continueURL = await this.authorizeContinue();
+        if (continueURL === `${AUTH_BASE_URL}/log-in/password`) {
+            this.logProgress(3, totalSteps, "提交登录密码");
+            continueURL = await this.passwordVerify();
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
+            this.logProgress(4, totalSteps, "提交邮箱验证码");
+            continueURL = await this.emailOtpValidate();
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/add-phone`) {
+            this.logProgress('4-a', totalSteps, "进入短信验证流程，从接码平台获取号码");
+            if (!this.smsBroker) {
+                throw new Error("未配置 SMS provider，无法进行短信验证");
+            }
+            const lease = await this.smsBroker.getActivation();
+            this.logProgress('4-b', totalSteps, `发送短信验证码，phone=+${lease.phoneNumber}`);
+            const phoneNumber = `+${lease.phoneNumber}`
+            continueURL = await this.sendPhoneOtp(phoneNumber)
+              // sendPhoneOtp 过程中可能遇到 phone_max_usage_exceed 错误，需要手动标记失败并进行轮换
+              .catch(async (e) => {
+                  await this.smsBroker?.markAsFailed(true)
+                  throw e
+              });
+            this.logProgress('4-c', totalSteps, `等待短信验证码`);
+            const { code } = await lease.waitForVerificationCode();
+            this.logProgress('4-d', totalSteps, `提交短信验证，code=[${code}]`);
+            continueURL = await this.validatePhone(code);
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
+            this.logProgress(5, totalSteps, "选择工作区");
+            continueURL = await this.selectWorkspace(continueURL);
+        }
+
+        this.logProgress(6, totalSteps, "交换授权并保存凭证");
+        const result = await this.followOAuthRedirects(continueURL);
+        const authRecord = await this.exchangeCodeForToken(result.code);
+        const authPath = await this.saveAuthRecord(authRecord);
+        result.authFile = authPath;
+        return result;
     }
 
     async authRegisterHTTP(): Promise<string> {
@@ -222,15 +380,136 @@ export class OpenAIClient {
             totalSteps += 1;
             this.logProgress(step++, totalSteps, "完成注册");
             await this.finishChatGPTRegistration(continueURL);
-            await archiveAccountRecord({
-                email: this.email,
-                password: this.password,
-                createdAt: formatLocalTimestamp(new Date()),
-            });
             console.log(`[注册成功] 邮箱：${this.email} 密码：${this.password}`);
         }
 
         return continueURL;
+    }
+
+    async authRegisterAndAuthorizeHTTP(): Promise<AuthLoginResult> {
+        const stepMessages = [
+            "打开直接注册授权页",
+            "提交注册邮箱",
+        ];
+        let totalSteps = stepMessages.length;
+        let step = 1;
+
+        if (!this.email) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "生成注册邮箱");
+            this.email = await this.generateRegisterEmail();
+            console.log("registerEmail:", this.email);
+        }
+
+        this.logProgress(step++, totalSteps, "打开直接注册授权页");
+        await this.openDirectSignupAuthorizePage(this.email);
+
+        this.logProgress(step++, totalSteps, "提交注册邮箱");
+        let continueURL = await this.authorizeContinueForSignup(this.signupScreenHint);
+
+        if (continueURL === `${AUTH_BASE_URL}/create-account/password`) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "提交注册密码");
+            continueURL = await this.registerPassword();
+        }
+
+        if (continueURL === AUTH_EMAIL_OTP_SEND_URL) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "发送邮箱验证码");
+            continueURL = await this.sendEmailOtp();
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "提交邮箱验证码");
+            continueURL = await this.emailOtpValidate();
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/add-phone`) {
+            if (!this.smsBroker) {
+                throw new Error("未配置 SMS provider，无法进行短信验证");
+            }
+            this.logProgress(step++, totalSteps++, "进入短信验证流程，从接码平台获取号码");
+            const lease = await this.smsBroker.getActivation();
+            this.logProgress(step++, totalSteps++, `发送短信验证码，phone=+${lease.phoneNumber}`);
+            const phoneNumber = `+${lease.phoneNumber}`
+            continueURL = await this.sendPhoneOtp(phoneNumber)
+              // sendPhoneOtp 过程中可能遇到 phone_max_usage_exceed 错误，需要手动标记失败并进行轮换
+              .catch(async (e) => {
+                  await this.smsBroker?.markAsFailed(true)
+                  throw e
+              });
+            this.logProgress(step++, totalSteps++, `等待短信验证码`);
+            const { code } = await lease.waitForVerificationCode();
+            this.logProgress(step++, totalSteps++, `提交短信验证，code=[${code}]`);
+            continueURL = await this.validatePhone(code);
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/about-you`) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "填写基础资料");
+            continueURL = await this.completeAboutYou();
+        }
+
+        if (continueURL === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
+            totalSteps += 1;
+            this.logProgress(step++, totalSteps, "选择工作区");
+            continueURL = await this.selectWorkspace(continueURL);
+        }
+
+        totalSteps += 1;
+        this.logProgress(step++, totalSteps, "交换授权并保存凭证");
+        return await this.finalizeAuthorizationFromContinueURL(continueURL);
+    }
+
+    prepareManualLogin(prompt: "login" | "none" = "login"): string {
+        this.state = randomUrlSafeString(24);
+        this.codeVerifier = randomUrlSafeString(64);
+        const query = new URLSearchParams({
+            client_id: DEFAULT_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: DEFAULT_REDIRECT_URI,
+            scope: "openid email profile offline_access",
+            state: this.state,
+            code_challenge: pkceCodeChallenge(this.codeVerifier),
+            code_challenge_method: "S256",
+            prompt,
+            id_token_add_organizations: "true",
+            codex_cli_simplified_flow: "true",
+        });
+        return `${AUTH_BASE_URL}/oauth/authorize?${query.toString()}`;
+    }
+
+    async authorizeContinue(): Promise<string> {
+        const sentinelToken = await this.fetchSentinelToken("authorize_continue");
+        const response = await this.fetch(AUTH_AUTHORIZE_CONTINUE_URL, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "openai-sentinel-token": sentinelToken,
+                "user-agent": this.userAgent,
+                "accept-language": this.deviceProfile.acceptLanguage,
+                "sec-ch-ua": this.clientHints.secChUa,
+                "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
+                "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
+                "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
+                "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
+                "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
+            },
+            body: JSON.stringify({
+                username: {
+                    kind: "email",
+                    value: this.email,
+                },
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(
+                `AuthorizeContinue请求失败: ${await this.formatErrorResponse(response)}`,
+            );
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        return payload.continue_url;
     }
 
     async authorizeContinueForSignup(screenHint = "login_or_signup"): Promise<string> {
@@ -252,6 +531,49 @@ export class OpenAIClient {
         if (!response.ok) {
             throw new Error(
                 `AuthorizeContinue注册请求失败: ${await this.formatErrorResponse(response)}`,
+            );
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        return payload.continue_url;
+    }
+
+    async passwordVerify(): Promise<string> {
+        const sentinelToken = await this.fetchSentinelToken("password_verify");
+        const response = await this.postJSON(
+            AUTH_PASSWORD_VERIFY_URL,
+            {
+                password: this.password,
+            },
+            {
+                referer: `${AUTH_BASE_URL}/log-in/password`,
+                sentinelToken,
+            },
+        );
+        if (!response.ok) {
+            throw new Error(
+                `PasswordVerify请求失败: ${await this.formatErrorResponse(response)}`,
+            );
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        return payload.continue_url;
+    }
+
+    async emailOtpValidate(): Promise<string> {
+        const code = await this.resolveEmailOtpCode();
+        const response = await this.fetch(AUTH_EMAIL_OTP_VALIDATE_URL, {
+            method: "POST",
+            headers: {
+                accept: "application/json",
+                "content-type": "application/json",
+                origin: AUTH_BASE_URL,
+                referer: `${AUTH_BASE_URL}/email-verification`,
+                "user-agent": this.userAgent,
+            },
+            body: JSON.stringify({code}),
+        });
+        if (!response.ok) {
+            throw new Error(
+                `EmailOtpValidate请求失败: ${await this.formatErrorResponse(response)}`,
             );
         }
         const payload = (await response.json()) as ContinueResponse;
@@ -305,30 +627,154 @@ export class OpenAIClient {
         return payload.continue_url;
     }
 
-    async emailOtpValidate(): Promise<string> {
-        const code = await this.resolveEmailOtpCode();
-        const response = await this.fetch(AUTH_EMAIL_OTP_VALIDATE_URL, {
-            method: "POST",
-            headers: {
-                accept: "application/json",
-                "content-type": "application/json",
-                origin: AUTH_BASE_URL,
-                referer: `${AUTH_BASE_URL}/email-verification`,
-                "user-agent": this.userAgent,
-            },
-            body: JSON.stringify({code}),
-        });
+    async validatePhone(code: string) {
+        const response = await this.postJSON(`${AUTH_BASE_URL}/api/accounts/phone-otp/validate`,
+          { code: code },
+          { referer: `${AUTH_BASE_URL}/phone-verification` },
+        );
         if (!response.ok) {
             throw new Error(
-                `EmailOtpValidate请求失败: ${await this.formatErrorResponse(response)}`,
+              `PhoneOtpValidate请求失败: ${await this.formatErrorResponse(response)}`,
             );
         }
         const payload = (await response.json()) as ContinueResponse;
         return payload.continue_url;
     }
 
+    async sendPhoneOtp(phoneNumber: string) {
+        const response = await this.postJSON(
+          `${AUTH_BASE_URL}/api/accounts/add-phone/send`,
+          {
+              phone_number: phoneNumber,
+          },
+          {
+              referer: `${AUTH_BASE_URL}/add-phone`,
+          },
+        );
+        if (!response.ok) {
+            throw new Error(
+              `SendPhoneOtp请求失败: ${await this.formatErrorResponse(response)}`,
+            );
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        return payload.continue_url;
+    }
+
+    async selectWorkspace(consentURL: string): Promise<string> {
+        await this.fetch(consentURL, {
+            method: "GET",
+            headers: {
+                accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                referer: `${AUTH_BASE_URL}/email-verification`,
+                "user-agent": this.userAgent,
+                "accept-language": this.deviceProfile.acceptLanguage,
+                "sec-ch-ua": this.clientHints.secChUa,
+                "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
+                "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
+                "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
+                "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
+                "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
+            },
+        });
+
+        const workspaceID = await this.resolveWorkspaceID();
+        const response = await this.fetch(AUTH_WORKSPACE_SELECT_URL, {
+            method: "POST",
+            headers: {
+                accept: "application/json",
+                "content-type": "application/json",
+                origin: AUTH_BASE_URL,
+                referer: consentURL,
+                "user-agent": this.userAgent,
+                "accept-language": this.deviceProfile.acceptLanguage,
+                "sec-ch-ua": this.clientHints.secChUa,
+                "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
+                "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
+                "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
+                "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
+                "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
+            },
+            body: JSON.stringify({
+                workspace_id: workspaceID,
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(
+                `WorkspaceSelect请求失败: ${await this.formatErrorResponse(response)}`,
+            );
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        return payload.continue_url;
+    }
+
+    async followOAuthRedirects(startURL: string): Promise<AuthLoginResult> {
+        let currentURL = startURL;
+        for (let hop = 0; hop < 10; hop++) {
+            const response = await this.fetch(currentURL, {
+                method: "GET",
+                redirect: "manual",
+                headers: {
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": this.userAgent,
+                    "accept-language": this.deviceProfile.acceptLanguage,
+                    "sec-ch-ua": this.clientHints.secChUa,
+                    "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
+                    "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
+                    "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
+                    "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
+                    "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
+                },
+            });
+
+            const location = response.headers.get("location");
+            if (location) {
+                const nextURL = new URL(location, currentURL).toString();
+                if (nextURL.startsWith(`${AUTH_BASE_URL}/add-phone`)) {
+                    throw new Error("当前账号在登录后触发了 add-phone 绑手机流程，无法直接完成授权");
+                }
+                if (nextURL.startsWith(DEFAULT_REDIRECT_URI)) {
+                    return this.extractAuthResult(nextURL);
+                }
+                currentURL = nextURL;
+                continue;
+            }
+
+            if (response.url.startsWith(`${AUTH_BASE_URL}/add-phone`)) {
+                throw new Error("当前账号在登录后触发了 add-phone 绑手机流程，无法直接完成授权");
+            }
+
+            if (response.url.startsWith(DEFAULT_REDIRECT_URI)) {
+                return this.extractAuthResult(response.url);
+            }
+
+            throw new Error(
+                `OAuth跳转未到达callback: status=${response.status} url=${response.url}`,
+            );
+        }
+
+        throw new Error(`OAuth跳转次数过多，最后停在: ${currentURL}`);
+    }
+
+    private async finalizeAuthorizationFromContinueURL(startURL: string): Promise<AuthLoginResult> {
+        if (startURL.startsWith(DEFAULT_REDIRECT_URI)) {
+            const result = this.extractAuthResult(startURL);
+            const authRecord = await this.exchangeCodeForToken(result.code);
+            result.authFile = await this.saveAuthRecord(authRecord);
+            return result;
+        }
+
+        const result = await this.followOAuthRedirects(startURL);
+        const authRecord = await this.exchangeCodeForToken(result.code);
+        result.authFile = await this.saveAuthRecord(authRecord);
+        return result;
+    }
+
     async fetchSentinelToken(
-        flow: "authorize_continue" | "username_password_create" | "oauth_create_account",
+        flow:
+            | "authorize_continue"
+            | "password_verify"
+            | "username_password_create"
+            | "oauth_create_account",
     ): Promise<string> {
         return fetchSentinelToken({
             flow,
@@ -411,6 +857,164 @@ export class OpenAIClient {
         if (!response.ok) {
             throw new Error(`完成 ChatGPT 注册回调失败: ${response.status}`);
         }
+    }
+
+    private async exchangeCodeForToken(code: string): Promise<SavedAuthRecord> {
+        let lastError = "";
+        for (const tokenURL of AUTH_OAUTH_TOKEN_URLS) {
+            const body = new URLSearchParams({
+                grant_type: "authorization_code",
+                client_id: DEFAULT_CLIENT_ID,
+                code,
+                redirect_uri: DEFAULT_REDIRECT_URI,
+                code_verifier: this.codeVerifier,
+            });
+            const response = await this.fetch(tokenURL, {
+                method: "POST",
+                headers: this.createBrowserHeaders({
+                    accept: "application/json",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-site",
+                }),
+                body,
+            });
+            if (!response.ok) {
+                lastError = `endpoint=${tokenURL} ${await this.formatErrorResponse(response)}`;
+                continue;
+            }
+
+            const payload = (await response.json()) as OAuthTokenResponse;
+            return this.normalizeAuthRecord(payload);
+        }
+
+        throw new Error(`Code换Token失败: ${lastError}`);
+    }
+
+    private async resolveWorkspaceID(): Promise<string> {
+        const cookie = await this.readCookie(
+            AUTH_BASE_URL,
+            "oai-client-auth-session",
+        );
+        if (!cookie) {
+            throw new Error("未找到 oai-client-auth-session cookie，无法提取 workspace");
+        }
+
+        const encodedPayload = cookie.split(".")[0];
+        const payload = this.decodeSignedJson<ClientAuthSessionPayload>(encodedPayload);
+        const workspaceID =
+            payload.workspaces?.find((w) => w.kind === "personal")?.id
+            ?? payload.workspaces?.[0]?.id;
+        if (!workspaceID) {
+            throw new Error(`当前会话未发现 workspace: ${JSON.stringify(payload)}`);
+        }
+        return workspaceID;
+    }
+
+    private decodeSignedJson<T>(encoded: string): T {
+        const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+        const json = Buffer.from(padded, "base64").toString("utf8");
+        return JSON.parse(json) as T;
+    }
+
+    private normalizeAuthRecord(payload: OAuthTokenResponse): SavedAuthRecord {
+        if (!payload.access_token) {
+            throw new Error(`token响应缺少 access_token: ${JSON.stringify(payload)}`);
+        }
+        if (!payload.refresh_token) {
+            throw new Error(`token响应缺少 refresh_token: ${JSON.stringify(payload)}`);
+        }
+        if (!payload.id_token) {
+            throw new Error(`token响应缺少 id_token: ${JSON.stringify(payload)}`);
+        }
+
+        const accessClaims = this.decodeJwtPayload<JwtPayload>(payload.access_token);
+        const idClaims = this.decodeJwtPayload<JwtPayload>(payload.id_token);
+        const email = idClaims.email ?? accessClaims.email ?? this.email;
+        const accountID =
+            accessClaims["https://api.openai.com/auth"]?.chatgpt_account_id ??
+            idClaims["https://api.openai.com/auth"]?.chatgpt_account_id ??
+            "";
+        const exp = accessClaims.exp;
+        if (!accountID) {
+            throw new Error(`token中缺少 account_id: ${JSON.stringify(accessClaims)}`);
+        }
+        if (!exp) {
+            throw new Error(`access_token中缺少 exp: ${JSON.stringify(accessClaims)}`);
+        }
+
+        return {
+            access_token: payload.access_token,
+            account_id: accountID,
+            disabled: false,
+            email,
+            expired: new Date(exp * 1000).toISOString(),
+            id_token: payload.id_token,
+            last_refresh: new Date().toISOString(),
+            refresh_token: payload.refresh_token,
+            type: "codex",
+            websockets: false,
+        };
+    }
+
+    private decodeJwtPayload<T>(token: string): T {
+        const parts = token.split(".");
+        if (parts.length < 2) {
+            throw new Error(`JWT格式不正确: ${token.slice(0, 24)}...`);
+        }
+        return this.decodeSignedJson<T>(parts[1]);
+    }
+
+    private extractAuthResult(callbackURL: string): AuthLoginResult {
+        const url = new URL(callbackURL);
+        const code = url.searchParams.get("code") ?? "";
+        const state = url.searchParams.get("state") ?? "";
+        if (!code) {
+            throw new Error(`callback 中缺少 code: ${callbackURL}`);
+        }
+        if (!state) {
+            throw new Error(`callback 中缺少 state: ${callbackURL}`);
+        }
+        if (this.state && state !== this.state) {
+            throw new Error(
+                `callback state 不匹配: expected=${this.state} actual=${state}`,
+            );
+        }
+        return {
+            callbackURL,
+            code,
+            state,
+        };
+    }
+
+    private async saveAuthRecord(record: SavedAuthRecord): Promise<string> {
+        const authDir = path.resolve(process.cwd(), "auth");
+        await mkdir(authDir, {recursive: true});
+        const now = new Date();
+        const date = [
+            now.getFullYear(),
+            `${now.getMonth() + 1}`.padStart(2, "0"),
+            `${now.getDate()}`.padStart(2, "0"),
+        ].join("-");
+        const safeEmail = record.email.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
+        const fileName = `${date}-${safeEmail}.json`;
+        const filePath = path.join(authDir, fileName);
+        await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+
+        if (shouldAutoUploadAuthToCLIProxyAPI()) {
+            try {
+                await uploadAuthFileToCLIProxyAPI(fileName, record);
+                console.log(`cliproxyApiAuthUploaded: ${fileName}`);
+            } catch (error) {
+                console.warn(
+                    `cliproxyApiAuthUploadFailed: ${fileName} error=${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        }
+
+        return filePath;
     }
 
     private randomProfile(): { name: string; birthdate: string } {
@@ -597,6 +1201,32 @@ export class OpenAIClient {
     private async readCookie(url: string, key: string): Promise<string> {
         const cookies = await this.jar.getCookies(url);
         return cookies.find((cookie) => cookie.key === key)?.value ?? "";
+    }
+
+    private async openDirectSignupAuthorizePage(email: string): Promise<void> {
+        const oauthUrl = this.prepareManualLogin();
+        const authorizeUrl = new URL(oauthUrl);
+        authorizeUrl.searchParams.set("screen_hint", this.signupScreenHint);
+        authorizeUrl.searchParams.set("login_hint", email);
+
+        const response = await this.fetch(authorizeUrl.toString(), {
+            method: "GET",
+            redirect: "follow",
+            headers: this.createBrowserHeaders({
+                "accept-encoding": "gzip, deflate, br",
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(`打开直接注册授权页失败: ${response.status}`);
+        }
+
+        this.deviceID = await this.readCookie("https://openai.com", "oai-did");
+        if (!this.deviceID) {
+            throw new Error("直接注册授权页未返回 oai-did cookie");
+        }
     }
 
     private createBrowserHeaders(init: Record<string, string>): Headers {

@@ -1,7 +1,7 @@
 import {appConfig} from "./config.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
 import {OpenAIClient} from "./openai.js";
-import {formatRecentMailSummary, lookupOtpCode, lookupRecentMails} from "./otp-cli.js";
+import {createSMSBroker} from "./sms/index.js";
 
 function readArgValue(flag: string): string {
     const index = process.argv.indexOf(flag);
@@ -24,20 +24,55 @@ function readNumberArg(flag: string): number | null {
     return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+
+const smsBroker = appConfig.heroSMSApiKey ? createSMSBroker({
+    apiKey: appConfig.heroSMSApiKey,
+    pollAttempts: appConfig.heroSMSPollAttempts,
+    pollIntervalMs: appConfig.heroSMSPollIntervalMs,
+    maxPrice: appConfig.heroSMSMaxPrice,
+    country: appConfig.heroSMSCountry
+}) : undefined
+
 async function runOnce(): Promise<void> {
     const email = readArgValue("--email").trim();
     const manualOtp = hasFlag("--otp");
+    const directSignupAuth = hasFlag("--sign");
     const deviceProfile = generateRandomDeviceProfile();
+    if (directSignupAuth) {
+        const client = new OpenAIClient({
+            email: email || undefined,
+            password: appConfig.defaultPassword,
+            deviceProfile,
+            manualMode: manualOtp,
+            signupScreenHint: "signup",
+            smsBroker
+        });
+        const result = await client.authRegisterAndAuthorizeHTTP();
+        console.log(
+            `[✅️授权成功] 邮箱：${client.email} 密码：${appConfig.defaultPassword} 授权文件：${result.authFile ?? ""}`,
+        );
+        return;
+    }
 
     const registerClient = new OpenAIClient({
         email: email || undefined,
         password: appConfig.defaultPassword,
         deviceProfile,
         manualMode: manualOtp,
+        smsBroker
     });
     await registerClient.authRegisterHTTP();
+
+    const loginClient = new OpenAIClient({
+        email: registerClient.email,
+        password: appConfig.defaultPassword,
+        deviceProfile,
+        manualMode: manualOtp,
+        smsBroker
+    });
+    const result = await loginClient.authLoginHTTP();
     console.log(
-        `[✅️注册成功] 邮箱：${registerClient.email} 密码：${appConfig.defaultPassword}`,
+        `[✅️授权成功] 邮箱：${loginClient.email} 密码：${appConfig.defaultPassword} 授权文件：${result.authFile ?? ""}`,
     );
 }
 
@@ -46,29 +81,29 @@ async function main() {
     let successCount = 0;
     let failCount = 0;
     const manualEmail = readArgValue("--email").trim();
+    const authOnly = hasFlag("--auth");
     const manualOtp = hasFlag("--otp");
     const maxRounds = readNumberArg("--n");
-    const otpLookupInput = readArgValue("--check-otp").trim();
-    const recentMailInput = readArgValue("--recent-mails").trim();
-    const recentMailLimit = readArgValue("--limit").trim();
 
-    if (otpLookupInput) {
-        const {email, code} = await lookupOtpCode(otpLookupInput);
-        console.log(`email=${email}`);
-        console.log(`otp=${code}`);
-        return;
-    }
-
-    if (recentMailInput) {
-        const result = await lookupRecentMails(recentMailInput, recentMailLimit);
-        console.log(`email=${result.email}`);
-        console.log(`limit=${result.limit}`);
-        if (result.mails.length === 0) {
-            console.log("最近邮件为空");
-            return;
+    if (authOnly) {
+        if (!manualEmail) {
+            throw new Error("使用 --auth 时必须同时指定 --email");
         }
-        for (const mail of result.mails) {
-            console.log(formatRecentMailSummary(mail));
+        try {
+            const deviceProfile = generateRandomDeviceProfile();
+            const client = new OpenAIClient({
+                email: manualEmail,
+                password: appConfig.defaultPassword,
+                deviceProfile,
+                manualMode: manualOtp,
+                smsBroker,
+            });
+            const result = await client.authLoginHTTP();
+            console.log(
+                `[✅️授权成功] 邮箱：${client.email} 密码：${appConfig.defaultPassword} 授权文件：${result.authFile ?? ""}`,
+            );
+        } catch (error) {
+            console.error(`[❌️授权失败]`, error);
         }
         return;
     }
@@ -77,7 +112,7 @@ async function main() {
         try {
             await runOnce();
         } catch (error) {
-            console.error(`[❌️注册失败]`, error);
+            console.error(`[❌️授权失败]`, error);
         }
         return;
     }
@@ -92,7 +127,7 @@ async function main() {
             successCount += 1;
         } catch (error) {
             failCount += 1;
-            console.error(`[❌️注册失败]`, error);
+            console.error(`[❌️授权失败]`, error);
         }
 
         if (appConfig.loopDelayMs > 0) {

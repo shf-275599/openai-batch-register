@@ -1,16 +1,16 @@
-# codex-register
+# openai-batch-register
 
 基于 [klsf/codex-register](https://github.com/klsf/codex-register) 的个人复刻版本。
 
-用于批量注册 OpenAI 账号、生成授权文件，并批量检查额度。
+用于批量注册 OpenAI 账号、授权 Codex 登录生成授权文件、批量检查额度。
 
 ## 功能
 
 - 批量注册 OpenAI 账号
-- 支持多种邮箱提供商：Cloudflare、Gmail、Hotmail、GPTMail 等
-- 自动生成授权文件
+- Codex 登录授权，生成 auth 文件
+- 自动上传 auth 到 CLIProxyAPI
 - 批量检查账号剩余额度
-- 支持 CLIProxyAPI 自动上传 auth
+- 支持多种邮箱提供商：Cloudflare、Gmail、Hotmail、GPTMail 等
 
 ## 环境要求
 
@@ -31,72 +31,43 @@ npm install
 cp config.example.json config.json
 ```
 
-编辑 `config.json`，至少修改：
-
-```json
-{
-  "provider": "cloudflare",
-  "defaultProxyUrl": "http://127.0.0.1:10808",
-  "defaultPassword": "your_password",
-  "cloudflareEmailDomain": "your-domain.com",
-  "cloudflareApiBaseUrl": "https://your-worker.workers.dev",
-  "cloudflareApiKey": "your_api_key"
-}
-```
+编辑 `config.json`，根据使用的邮箱提供商配置。
 
 ### 3. 运行
 
 ```bash
-# 开发模式
-npm run dev
-
-# 只跑 1 轮
 npm run dev -- --n 1
-
-# 构建后运行
-npm run build
-npm run start
+npm run build && npm run start
 ```
-
-### 4. 检查额度
-
-```bash
-npm run check
-npm run check -- --limit 20 --table
-```
-
-## 支持的邮箱提供商
-
-| 提供商 | 说明 |
-|--------|------|
-| `cloudflare` | 自有域名，需配置 Cloudflare Email Routing + Worker |
-| `gmail` | 需要 Gmail API token |
-| `hotmail` | 需要 Hotmail/Outlook 账号的 refresh_token |
-| `gptmail` | 需要 GPTMail API Key |
-| `2925` | 需要 2925 邮箱账号 |
 
 ## 常用命令
 
+### 注册并授权
+
 ```bash
-# 指定邮箱注册并授权
-npm run dev -- --email your_mail@example.com
+npm run dev -- --n 1                          # 自动注册 1 个
+npm run dev -- --email your@email.com --sign  # 指定邮箱注册并授权
+```
 
-# 只做登录授权
-npm run dev -- --email your_mail@example.com --auth
+### 只做登录授权
 
-# 手动输入验证码
-npm run dev -- --email your_mail@example.com --otp
+```bash
+npm run dev -- --email your@email.com --auth  # 生成 auth 文件
+```
 
-# 直接注册并授权
-npm run dev -- --email your_mail@example.com --sign
+### 检查额度
+
+```bash
+npm run check                                 # 检查本地 auth 目录
+npm run check -- --limit 20 --table           # 检查前 20 个，显示表格
+npm run check -- --refresh --table            # 刷新 token 后检查
+npm run check:cpa                             # 从 CLIProxyAPI 检查
 ```
 
 ## 安全提醒
 
-- `config.json` 包含敏感信息，已被 `.gitignore` 排除
-- `accounts/` 目录包含账号密码，已被 `.gitignore` 排除
-- `auth/` 目录包含授权文件，已被 `.gitignore` 排除
-- **请勿将上述文件提交到公开仓库**
+- `config.json`、`accounts/`、`auth/` 已被 `.gitignore` 排除
+- **请勿将敏感文件提交到公开仓库**
 
 ## 致谢
 
@@ -104,7 +75,7 @@ npm run dev -- --email your_mail@example.com --sign
 
 ## 免责声明
 
-本项目仅供学习与研究使用。使用者应自行确保其用途符合目标平台的服务条款和当地法律法规。因使用本项目导致的任何后果，均由使用者自行承担。
+本项目仅供学习与研究使用。因使用本项目导致的任何后果，均由使用者自行承担。
 
 ## 许可证
 

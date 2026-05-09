@@ -3,6 +3,8 @@ import {defineConfig} from "tsup";
 export default defineConfig({
     entry: {
         index: "src/index.ts",
+        "check-auth-quota": "src/check-auth-quota.ts",
+        "batch-register": "src/batch-register.ts",
     },
     outDir: "bundle",
     format: ["cjs"],

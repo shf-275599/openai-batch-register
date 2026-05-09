@@ -23,15 +23,6 @@ interface CloudflareMailboxListPayload {
 
 interface CloudflareLatestMailPayload extends CloudflareMailItem {}
 
-export interface CloudflareMailboxEntry {
-    id: string;
-    sender: string;
-    recipient: string;
-    subject: string;
-    content: string;
-    timestamp: number;
-}
-
 const CLOUDFLARE_POLL_ATTEMPTS = 36;
 const CLOUDFLARE_POLL_INTERVAL_MS = 5000;
 
@@ -121,16 +112,12 @@ async function fetchLatestMailbox(email: string): Promise<CloudflareLatestMailPa
 }
 
 async function fetchMailboxList(email: string): Promise<CloudflareMailboxListPayload> {
-    return fetchMailboxListWithLimit(email, 10);
-}
-
-async function fetchMailboxListWithLimit(email: string, limit: number): Promise<CloudflareMailboxListPayload> {
     const mailbox = buildMailbox(email);
     const baseUrl = ensureApiBaseUrlConfigured();
     const apiKey = ensureApiKeyConfigured();
     const url = new URL(`${baseUrl}/emails`);
     url.searchParams.set("to", mailbox);
-    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("limit", "10");
 
     const response = await cloudflareFetch(url, {
         method: "GET",
@@ -152,18 +139,6 @@ async function fetchMailboxListWithLimit(email: string, limit: number): Promise<
     return payload;
 }
 
-function toMailboxEntry(mail: CloudflareMailItem): CloudflareMailboxEntry {
-    return {
-        ...mail,
-        id: mail.id == null ? String(mail.message_id ?? "") : String(mail.id),
-        sender: String(mail.from_email ?? ""),
-        recipient: String(mail.mailbox ?? ""),
-        subject: String(mail.subject ?? ""),
-        content: String(mail.raw_text ?? ""),
-        timestamp: Number(mail.received_at ?? 0),
-    };
-}
-
 export function createCloudflareProvider() {
     return {
         async getEmailAddress() {
@@ -181,7 +156,15 @@ export function createCloudflareProvider() {
                 const candidates = [
                     ...(latestMail ? [latestMail] : []),
                     ...(mailboxList.emails ?? []),
-                ].map(toMailboxEntry);
+                ].map((mail) => ({
+                    ...mail,
+                    id: mail.id == null ? String(mail.message_id ?? "") : String(mail.id),
+                    sender: String(mail.from_email ?? ""),
+                    recipient: String(mail.mailbox ?? ""),
+                    subject: String(mail.subject ?? ""),
+                    content: String(mail.raw_text ?? ""),
+                    timestamp: Number(mail.received_at ?? 0),
+                }));
                 const matchedMail = findLatestVerificationMail(candidates, {
                     targetEmail: buildMailbox(email),
                 });
@@ -196,14 +179,6 @@ export function createCloudflareProvider() {
             }
 
             throw new Error(`Cloudflare 邮箱中未找到验证码: targetEmail=${email}`);
-        },
-        async getRecentMails(email: string, limit: number) {
-            ensureDomainConfigured();
-            ensureApiBaseUrlConfigured();
-            ensureApiKeyConfigured();
-
-            const mailboxList = await fetchMailboxListWithLimit(email, limit);
-            return (mailboxList.emails ?? []).map(toMailboxEntry);
         },
     };
 }

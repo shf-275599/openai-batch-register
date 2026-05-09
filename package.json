@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsup --config tsup.config.ts",
-    "start": "node bundle/index.cjs"
+    "start": "node bundle/index.cjs",
+    "check": "node bundle/check-auth-quota.cjs",
+    "check:cpa": "node bundle/check-auth-quota.cjs --cpa",
+    "batch": "node bundle/batch-register.cjs"
   },
   "dependencies": {
     "chromium-bidi": "^15.0.0",
