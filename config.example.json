@@ -1,0 +1,8 @@
+{
+  "defaultProxyUrl": "",
+  "defaultPassword": "kuaileshifu88",
+  "loopDelayMs": 30000,
+  "cloudflareEmailDomain": "your-domain.com",
+  "cloudflareApiBaseUrl": "https://mail-d1-api.xxx.workers.dev",
+  "cloudflareApiKey": "your_api_key"
+}
